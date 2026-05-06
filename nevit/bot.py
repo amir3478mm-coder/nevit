@@ -2,7 +2,10 @@ import asyncio
 import time
 import logging
 import os
+import json
 from typing import Optional, List, Dict, Union, Callable, Any
+from datetime import datetime, timedelta
+
 from .client import NevitClient, NevitAsyncClient
 from .types import User, Chat, Message
 from .keyboards import Keyboard
@@ -12,11 +15,14 @@ from .error_handler import ErrorHandler
 from .state import UserState
 from .database import Database
 from .scheduler import Scheduler
+from .chat_join_request import ChatJoinRequestHandler, ChatJoinRequest
+from .backup import BackupManager
 
 logger = logging.getLogger("nevit")
 
 class NevitBot:
     def __init__(self, token: str):
+        self.token = token
         self.client = NevitClient(token)
         self.offset = 0
         self.commands: Dict[str, Callable] = {}
@@ -38,6 +44,11 @@ class NevitBot:
         self._log_file = None
         self._log_level = logging.INFO
         self._languages = {}
+        self.join_request_handler = ChatJoinRequestHandler(self)
+        self.backup_manager = None
+        self.auto_backup_job = None
+        self._payment_handlers = []
+        self._pre_checkout_handlers = []
         
         me = self.client.get_me()
         if me.get("ok"):
@@ -78,8 +89,24 @@ class NevitBot:
         def decorator(func: Callable):
             if event == "callback":
                 self.default_callback_handler = func
+            elif event == "successful_payment":
+                self._payment_handlers.append(func)
+            elif event == "pre_checkout_query":
+                self._pre_checkout_handlers.append(func)
             else:
                 self.messages.append((None, func))
+            return func
+        return decorator
+    
+    def on_successful_payment(self):
+        def decorator(func: Callable):
+            self._payment_handlers.append(func)
+            return func
+        return decorator
+    
+    def on_pre_checkout_query(self):
+        def decorator(func: Callable):
+            self._pre_checkout_handlers.append(func)
             return func
         return decorator
     
@@ -98,6 +125,18 @@ class NevitBot:
             self.error_handler.handlers.append(func)
             return func
         return func
+    
+    def chat_join_request(self):
+        def decorator(func: Callable):
+            self.join_request_handler.register(func)
+            return func
+        return decorator
+    
+    def approve_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return self.client.approve_chat_join_request(chat_id, user_id)
+    
+    def decline_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return self.client.decline_chat_join_request(chat_id, user_id)
     
     def add_middleware(self, middleware):
         self.middleware_manager.add(middleware)
@@ -178,6 +217,44 @@ class NevitBot:
     def start_scheduler(self):
         self.scheduler.start()
     
+    def start_auto_backup(self, db_path: str = "nevit_bot.db", interval_hours: int = 24):
+        self.backup_manager = BackupManager(self)
+        self.backup_db_path = db_path
+        
+        def take_backup():
+            result = self.backup_manager.backup_database(db_path)
+            if result:
+                logger.info(f"auto backup done: {result}")
+                self.backup_manager.delete_old_backups(30)
+            else:
+                logger.warning("auto backup failed")
+        
+        if interval_hours == 24:
+            self.scheduler.every(1).days().at("00:00")(take_backup)
+        else:
+            @self.scheduler.every(interval_hours).hours()
+            def scheduled_backup():
+                take_backup()
+        
+        self.start_scheduler()
+        logger.info(f"auto backup started (every {interval_hours} hours)")
+    
+    def manual_backup(self) -> str:
+        if self.backup_manager:
+            return self.backup_manager.backup_database(self.backup_db_path)
+        return None
+    
+    def get_backup_list(self) -> List[str]:
+        if self.backup_manager:
+            return self.backup_manager.list_backups()
+        return []
+    
+    def restore_from_backup(self, backup_name: str) -> bool:
+        if self.backup_manager:
+            backup_path = os.path.join("backups", backup_name)
+            return self.backup_manager.restore(backup_path, self.backup_db_path)
+        return False
+    
     def reply(self, message: Message, text: str, **kwargs) -> dict:
         return self.send_message(message.chat.id, text, reply_to_message_id=message.message_id, **kwargs)
     
@@ -216,6 +293,12 @@ class NevitBot:
     
     def send_dice(self, chat_id: int, emoji: str = None, **kwargs) -> dict:
         return self.client.send_dice(chat_id, emoji, **kwargs)
+    
+    def send_invoice(self, chat_id: int, title: str, description: str, payload: str, provider_token: str, currency: str, prices: List[dict], **kwargs) -> dict:
+        return self.client.send_invoice(chat_id, title, description, payload, provider_token, currency, prices, **kwargs)
+    
+    def answer_pre_checkout_query(self, pre_checkout_query_id: str, ok: bool, error_message: str = None) -> dict:
+        return self.client.answer_pre_checkout_query(pre_checkout_query_id, ok, error_message)
     
     def forward_message(self, chat_id: int, from_chat_id: int, message_id: int) -> dict:
         return self.client.forward_message(chat_id, from_chat_id, message_id)
@@ -265,8 +348,8 @@ class NevitBot:
     def unpin_message(self, chat_id: int, message_id: int = None) -> dict:
         return self.client.unpin_chat_message(chat_id, message_id)
     
-    def run(self):
-        logger.info("ربات Nevit فعال شد")
+    def _run_polling(self):
+        logger.info("bot started with polling mode")
         
         while True:
             try:
@@ -278,8 +361,13 @@ class NevitBot:
                         if "callback_query" in result:
                             try:
                                 self._handle_callback(result["callback_query"])
-                            except Exception as e:
-                                asyncio.run(self.error_handler.emit(e, {"update": result}))
+                            except Exception as error:
+                                try:
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    loop.run_until_complete(self.error_handler.emit(error, {"update": result}))
+                                except:
+                                    pass
                             self.offset = update + 1
                             continue
                         
@@ -287,32 +375,108 @@ class NevitBot:
                             if self.inline_handler:
                                 try:
                                     self.inline_handler(result["inline_query"])
-                                except Exception as e:
-                                    asyncio.run(self.error_handler.emit(e, {"update": result}))
+                                except Exception as error:
+                                    try:
+                                        loop = asyncio.new_event_loop()
+                                        asyncio.set_event_loop(loop)
+                                        loop.run_until_complete(self.error_handler.emit(error, {"update": result}))
+                                    except:
+                                        pass
+                            self.offset = update + 1
+                            continue
+                        
+                        if "chat_join_request" in result:
+                            try:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                                loop.run_until_complete(self.join_request_handler.process(result))
+                            except Exception as error:
+                                try:
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    loop.run_until_complete(self.error_handler.emit(error, {"update": result}))
+                                except:
+                                    pass
+                            self.offset = update + 1
+                            continue
+                        
+                        if "pre_checkout_query" in result:
+                            try:
+                                self._handle_pre_checkout(result["pre_checkout_query"])
+                            except Exception as error:
+                                logger.error(f"pre_checkout error: {error}")
                             self.offset = update + 1
                             continue
                         
                         if "message" in result:
                             try:
-                                msg = self._parse_message(result["message"])
-                                self._handle_message(msg)
-                            except Exception as e:
-                                asyncio.run(self.error_handler.emit(e, {"update": result}))
+                                if result["message"].get("successful_payment"):
+                                    self._handle_successful_payment(result["message"])
+                                else:
+                                    msg = self._parse_message(result["message"])
+                                    self._handle_message(msg)
+                            except Exception as error:
+                                try:
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    loop.run_until_complete(self.error_handler.emit(error, {"update": result}))
+                                except:
+                                    pass
                             self.offset = update + 1
                             continue
-            except Exception as e:
-                logger.error(f"خطا: {e}")
+            except Exception as error:
+                logger.error(f"polling error: {error}")
                 time.sleep(1)
     
+    def _handle_pre_checkout(self, pre_checkout_query):
+        query_id = pre_checkout_query.get("id")
+        ok = True
+        error_message = None
+        
+        for handler in self._pre_checkout_handlers:
+            try:
+                result = handler(pre_checkout_query)
+                if result is False:
+                    ok = False
+                    error_message = "پرداخت امکان پذیر نیست"
+                    break
+            except Exception as error:
+                logger.error(f"pre_checkout handler error: {error}")
+                ok = False
+                error_message = "خطا در پردازش"
+                break
+        
+        self.answer_pre_checkout_query(query_id, ok, error_message)
+    
+    def _handle_successful_payment(self, message_data):
+        try:
+            msg = self._parse_message(message_data)
+            for handler in self._payment_handlers:
+                try:
+                    handler(msg)
+                except Exception as error:
+                    logger.error(f"payment handler error: {error}")
+        except Exception as error:
+            logger.error(f"successful payment error: {error}")
+    
     def _handle_message(self, message: Message):
-        message = asyncio.run(self.middleware_manager.pre_process(message, {}))
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            message = loop.run_until_complete(self.middleware_manager.pre_process(message, {}))
+        except:
+            pass
+        
         if message is None:
             return
         
         if message.text:
             for keyword, reply in self.auto_replies.items():
                 if keyword in message.text.lower():
-                    asyncio.run(self.reply(message, reply))
+                    try:
+                        self.reply(message, reply)
+                    except:
+                        pass
                     return
         
         if message.text and message.text.startswith("/"):
@@ -320,8 +484,13 @@ class NevitBot:
             if cmd in self.commands:
                 try:
                     self.commands[cmd](message)
-                except Exception as e:
-                    asyncio.run(self.error_handler.emit(e, {"message": message, "command": cmd}))
+                except Exception as error:
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.error_handler.emit(error, {"message": message, "command": cmd}))
+                    except:
+                        pass
                 return
         
         for filter_func, handler in self.messages:
@@ -329,8 +498,13 @@ class NevitBot:
                 if filter_func is None or filter_func(message):
                     handler(message)
                     return
-            except Exception as e:
-                asyncio.run(self.error_handler.emit(e, {"message": message}))
+            except Exception as error:
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.error_handler.emit(error, {"message": message}))
+                except:
+                    pass
         
         if self.default_message_handler:
             self.default_message_handler(message)
@@ -368,18 +542,31 @@ class NevitBot:
                 if pattern == data:
                     try:
                         handler(message, data)
-                    except Exception as e:
-                        asyncio.run(self.error_handler.emit(e, {"callback": callback_data}))
+                    except Exception as error:
+                        try:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            loop.run_until_complete(self.error_handler.emit(error, {"callback": callback_data}))
+                        except:
+                            pass
                     found = True
                     break
             
             if not found and self.default_callback_handler:
                 try:
                     self.default_callback_handler(message, data)
-                except Exception as e:
-                    asyncio.run(self.error_handler.emit(e, {"callback": callback_data}))
+                except Exception as error:
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.error_handler.emit(error, {"callback": callback_data}))
+                    except:
+                        pass
         
-        self.client.answer_callback_query(query_id)
+        try:
+            self.client.answer_callback_query(query_id)
+        except:
+            pass
     
     def _parse_message(self, data: dict) -> Message:
         user_data = data.get("from", {})
@@ -413,6 +600,9 @@ class NevitBot:
             caption=data.get("caption")
         )
         
+        if data.get("successful_payment"):
+            message.successful_payment = data.get("successful_payment")
+        
         for key in ['photo', 'video', 'audio', 'voice', 'document', 'sticker',
                    'location', 'venue', 'contact', 'poll', 'dice', 'game',
                    'invoice', 'new_chat_members', 'left_chat_member',
@@ -422,13 +612,17 @@ class NevitBot:
         
         return message
     
+    def run(self):
+        self._run_polling()
+    
     def stop(self):
-        logger.info("ربات متوقف شد")
+        logger.info("bot stopped")
         exit(0)
 
 
 class NevitAsyncBot:
     def __init__(self, token: str):
+        self.token = token
         self.client = NevitAsyncClient(token)
         self.offset = 0
         self.commands: Dict[str, Callable] = {}
@@ -440,14 +634,18 @@ class NevitAsyncBot:
         self.middleware_manager = MiddlewareManager()
         self.error_handler = ErrorHandler()
         self.user_state = UserState()
+        self.join_request_handler = ChatJoinRequestHandler(self)
+        self.backup_manager = None
+        self._payment_handlers = []
+        self._pre_checkout_handlers = []
         
         loop = asyncio.get_event_loop()
         me = loop.run_until_complete(self.client.get_me())
         if me.get("ok"):
             self._bot_info = me["result"]
-            logger.info(f"ربات آسینک {self._bot_info['first_name']} متصل شد")
+            logger.info(f"async bot {self._bot_info['first_name']} connected")
         else:
-            raise Exception("توکن نامعتبر است")
+            raise Exception("invalid token")
     
     @property
     def bot_info(self):
@@ -479,8 +677,24 @@ class NevitAsyncBot:
         def decorator(func: Callable):
             if event == "callback":
                 self.default_callback_handler = func
+            elif event == "successful_payment":
+                self._payment_handlers.append(func)
+            elif event == "pre_checkout_query":
+                self._pre_checkout_handlers.append(func)
             else:
                 self.messages.append((None, func))
+            return func
+        return decorator
+    
+    def on_successful_payment(self):
+        def decorator(func: Callable):
+            self._payment_handlers.append(func)
+            return func
+        return decorator
+    
+    def on_pre_checkout_query(self):
+        def decorator(func: Callable):
+            self._pre_checkout_handlers.append(func)
             return func
         return decorator
     
@@ -496,6 +710,18 @@ class NevitAsyncBot:
             self.error_handler.handlers.append(func)
             return func
         return func
+    
+    def chat_join_request(self):
+        def decorator(func: Callable):
+            self.join_request_handler.register(func)
+            return func
+        return decorator
+    
+    async def approve_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return await self.client.approve_chat_join_request(chat_id, user_id)
+    
+    async def decline_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return await self.client.decline_chat_join_request(chat_id, user_id)
     
     def add_middleware(self, middleware):
         self.middleware_manager.add(middleware)
@@ -516,6 +742,31 @@ class NevitAsyncBot:
     
     def clear_state(self, user_id: int):
         self.user_state.delete(user_id)
+    
+    def start_auto_backup(self, db_path: str = "nevit_bot.db", interval_hours: int = 24):
+        self.backup_manager = BackupManager(self)
+        self.backup_db_path = db_path
+        
+        async def take_backup():
+            result = self.backup_manager.backup_database(db_path)
+            if result:
+                logger.info(f"auto backup done: {result}")
+                self.backup_manager.delete_old_backups(30)
+            else:
+                logger.warning("auto backup failed")
+        
+        async def backup_wrapper():
+            await take_backup()
+        
+        from apscheduler.triggers.interval import IntervalTrigger
+        from apscheduler.triggers.cron import CronTrigger
+        
+        if interval_hours == 24:
+            self.scheduler.add_job(backup_wrapper, CronTrigger(hour=0, minute=0))
+        else:
+            self.scheduler.add_job(backup_wrapper, IntervalTrigger(hours=interval_hours))
+        
+        logger.info(f"auto backup started (every {interval_hours} hours)")
     
     async def reply(self, message: Message, text: str, **kwargs) -> dict:
         return await self.send_message(message.chat.id, text, reply_to_message_id=message.message_id, **kwargs)
@@ -539,7 +790,7 @@ class NevitAsyncBot:
         return await self.client.answer_callback_query(callback_query_id, text, show_alert)
     
     async def run(self):
-        logger.info("ربات آسینک Nevit فعال شد")
+        logger.info("async bot started")
         
         while True:
             try:
@@ -551,8 +802,8 @@ class NevitAsyncBot:
                         if "callback_query" in result:
                             try:
                                 await self._handle_callback(result["callback_query"])
-                            except Exception as e:
-                                await self.error_handler.emit(e, {"update": result})
+                            except Exception as error:
+                                await self.error_handler.emit(error, {"update": result})
                             self.offset = update + 1
                             continue
                         
@@ -560,22 +811,72 @@ class NevitAsyncBot:
                             if self.inline_handler:
                                 try:
                                     await self.inline_handler(result["inline_query"])
-                                except Exception as e:
-                                    await self.error_handler.emit(e, {"update": result})
+                                except Exception as error:
+                                    await self.error_handler.emit(error, {"update": result})
+                            self.offset = update + 1
+                            continue
+                        
+                        if "chat_join_request" in result:
+                            try:
+                                await self.join_request_handler.process(result)
+                            except Exception as error:
+                                await self.error_handler.emit(error, {"update": result})
+                            self.offset = update + 1
+                            continue
+                        
+                        if "pre_checkout_query" in result:
+                            try:
+                                await self._handle_pre_checkout(result["pre_checkout_query"])
+                            except Exception as error:
+                                logger.error(f"pre_checkout error: {error}")
                             self.offset = update + 1
                             continue
                         
                         if "message" in result:
                             try:
-                                msg = self._parse_message(result["message"])
-                                await self._handle_message(msg)
-                            except Exception as e:
-                                await self.error_handler.emit(e, {"update": result})
+                                if result["message"].get("successful_payment"):
+                                    await self._handle_successful_payment(result["message"])
+                                else:
+                                    msg = self._parse_message(result["message"])
+                                    await self._handle_message(msg)
+                            except Exception as error:
+                                await self.error_handler.emit(error, {"update": result})
                             self.offset = update + 1
                             continue
-            except Exception as e:
-                logger.error(f"خطا: {e}")
+            except Exception as error:
+                logger.error(f"async error: {error}")
                 await asyncio.sleep(1)
+    
+    async def _handle_pre_checkout(self, pre_checkout_query):
+        query_id = pre_checkout_query.get("id")
+        ok = True
+        error_message = None
+        
+        for handler in self._pre_checkout_handlers:
+            try:
+                result = handler(pre_checkout_query)
+                if result is False:
+                    ok = False
+                    error_message = "پرداخت امکان پذیر نیست"
+                    break
+            except Exception as error:
+                logger.error(f"pre_checkout handler error: {error}")
+                ok = False
+                error_message = "خطا در پردازش"
+                break
+        
+        await self.client.answer_pre_checkout_query(query_id, ok, error_message)
+    
+    async def _handle_successful_payment(self, message_data):
+        try:
+            msg = self._parse_message(message_data)
+            for handler in self._payment_handlers:
+                try:
+                    await handler(msg)
+                except Exception as error:
+                    logger.error(f"payment handler error: {error}")
+        except Exception as error:
+            logger.error(f"successful payment error: {error}")
     
     async def _handle_message(self, message: Message):
         message = await self.middleware_manager.pre_process(message, {})
@@ -587,8 +888,8 @@ class NevitAsyncBot:
             if cmd in self.commands:
                 try:
                     await self.commands[cmd](message)
-                except Exception as e:
-                    await self.error_handler.emit(e, {"message": message, "command": cmd})
+                except Exception as error:
+                    await self.error_handler.emit(error, {"message": message, "command": cmd})
                 return
         
         for filter_func, handler in self.messages:
@@ -596,8 +897,8 @@ class NevitAsyncBot:
                 if filter_func is None or filter_func(message):
                     await handler(message)
                     return
-            except Exception as e:
-                await self.error_handler.emit(e, {"message": message})
+            except Exception as error:
+                await self.error_handler.emit(error, {"message": message})
         
         if self.default_message_handler:
             await self.default_message_handler(message)
@@ -635,16 +936,16 @@ class NevitAsyncBot:
                 if pattern == data:
                     try:
                         await handler(message, data)
-                    except Exception as e:
-                        await self.error_handler.emit(e, {"callback": callback_data})
+                    except Exception as error:
+                        await self.error_handler.emit(error, {"callback": callback_data})
                     found = True
                     break
             
             if not found and self.default_callback_handler:
                 try:
                     await self.default_callback_handler(message, data)
-                except Exception as e:
-                    await self.error_handler.emit(e, {"callback": callback_data})
+                except Exception as error:
+                    await self.error_handler.emit(error, {"callback": callback_data})
         
         await self.client.answer_callback_query(query_id)
     
@@ -680,6 +981,9 @@ class NevitAsyncBot:
             caption=data.get("caption")
         )
         
+        if data.get("successful_payment"):
+            message.successful_payment = data.get("successful_payment")
+        
         for key in ['photo', 'video', 'audio', 'voice', 'document', 'sticker',
                    'location', 'venue', 'contact', 'poll', 'dice', 'game',
                    'invoice', 'new_chat_members', 'left_chat_member',
@@ -690,4 +994,4 @@ class NevitAsyncBot:
         return message
     
     async def stop(self):
-        logger.info("ربات آسینک متوقف شد")
+        logger.info("async bot stopped")

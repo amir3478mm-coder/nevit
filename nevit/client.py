@@ -75,6 +75,12 @@ class NevitClient:
     def delete_webhook(self) -> dict:
         return self._request("deleteWebhook")
     
+    def approve_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return self._request("approveChatJoinRequest", {"chat_id": chat_id, "user_id": user_id})
+    
+    def decline_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return self._request("declineChatJoinRequest", {"chat_id": chat_id, "user_id": user_id})
+    
     def send_message(self, chat_id: int, text: str, parse_mode: str = None,
                      disable_web_page_preview: bool = None,
                      disable_notification: bool = None,
@@ -473,6 +479,12 @@ class NevitAsyncClient:
         except Exception as e:
             logger.error(f"Async file upload error: {e}")
             return {"ok": False, "error": str(e)}
+    
+    async def approve_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return await self._request("approveChatJoinRequest", {"chat_id": chat_id, "user_id": user_id})
+    
+    async def decline_chat_join_request(self, chat_id: int, user_id: int) -> dict:
+        return await self._request("declineChatJoinRequest", {"chat_id": chat_id, "user_id": user_id})
     
     async def get_me(self) -> dict:
         return await self._request("getMe")

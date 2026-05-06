@@ -18,8 +18,20 @@ from .inline import InlineQueryHandler
 from .file_handler import FileHandler
 from .webapp import WebAppData, WebAppHandler
 from .scheduler import Scheduler
+from .chat_join_request import ChatJoinRequest, ChatJoinRequestHandler
+from .payment import PaymentSystem
+from .reminder import Reminder
+from .downloader import Downloader
+from .calculator import Calculator
+from .levels import Levels
+from .vip import VIP
+from .groups import GroupManager
+from .booking import Booking
+from .force_subscribe import ForceSubscribe
+from .coupon import Coupon
+from .referral import Referral
 
-__version__ = "6.0.6"
+__version__ = "6.0.7"
 
 __all__ = [
     "NevitBot", "NevitAsyncBot",
@@ -43,4 +55,17 @@ __all__ = [
     "InlineQueryHandler",
     "FileHandler",
     "Scheduler",
+    "ChatJoinRequest", "ChatJoinRequestHandler",
+    "PaymentSystem",
+    "Reminder",
+    "Downloader",
+    "Calculator",
+    "Levels",
+    "VIP",
+    "GroupManager",
+    "Booking",
+    "ForceSubscribe",
+    "Coupon",
+    "Referral",
+    "SafeWebSocket",
 ]

@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nevit"
-version = "6.0.6"
+version = "6.0.7"
 description = "کتابخانه قدرتمند ساخت ربات در پیام‌رسان بله"
 readme = "README.md"
 authors = [{name = "Nevit Team"}]
 license = {text = "MIT"}
 requires-python = ">=3.7"
-dependencies = []
+dependencies = [
+    "httpx>=0.24.0",
+    "apscheduler>=3.10.0"
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
