@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nevit"
-version = "6.0.7"
+version = "6.0.8"
 description = "کتابخانه قدرتمند ساخت ربات در پیام‌رسان بله"
 readme = "README.md"
 authors = [{name = "Nevit Team"}]
